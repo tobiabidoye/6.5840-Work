@@ -54,7 +54,7 @@ func (c *Coordinator) server(sockname string) {
 }
 
 func (c *Coordinator) TasksDone(req *TaskDoneReq, reply *TaskDoneResp) error {
-	//only for map tasks
+	//to set tasks as done for both map and reduce tasks
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	taskId := req.CurTask.TaskId

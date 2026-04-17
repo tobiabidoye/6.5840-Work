@@ -1,11 +1,14 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
 
+	"golang.org/x/text/cases"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -23,7 +26,6 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
@@ -34,6 +36,26 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+	//get a task from the coordinator
+	for {
+		//keep looping until success of rpc call
+		workerResp, rpcStatus := CallAssignTask()
+		task := workerResp.CurTask
+
+		if !rpcStatus {
+			//exit on failed rpc
+			return
+		}
+
+		switch task.CurType {
+		case Map:
+		case Reduce:
+		case Wait:
+		case Exit:
+			return
+		}
+
+	}
 
 }
 
@@ -62,6 +84,20 @@ func CallExample() {
 	} else {
 		fmt.Printf("call failed!\n")
 	}
+}
+
+func CallAssignTask() (WorkerResp, bool) {
+	emptyReq := WorkerRequest{}
+	workerTask := WorkerResp{}
+	ok := call("Coordinator.AssignTask", &emptyReq, &workerTask)
+	if !ok {
+		fmt.Printf("Worker rpc call failed")
+		return workerTask, false
+	} else {
+		fmt.Printf("Worker rpc call successful")
+	}
+
+	return workerTask, true
 }
 
 // send an RPC request to the coordinator, wait for the response.
