@@ -46,7 +46,9 @@ func main() {
 			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
+		//return slice of key value pairs from the file
 		kva := mapf(filename, string(content))
+		//append by element not whole slice
 		intermediate = append(intermediate, kva...)
 	}
 
