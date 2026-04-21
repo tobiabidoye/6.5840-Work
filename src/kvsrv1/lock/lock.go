@@ -1,7 +1,15 @@
 package lock
 
 import (
+	"log"
+
+	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
+)
+
+const (
+	acquired = "acquired"
+	released = "released"
 )
 
 type Lock struct {
@@ -9,7 +17,9 @@ type Lock struct {
 	// the specific Clerk type of ck but promises that ck supports
 	// Put and Get.  The tester passes the clerk in when calling
 	// MakeLock().
-	ck kvtest.IKVClerk
+	ck      kvtest.IKVClerk
+	curKey  string
+	version int
 	// You may add code here
 }
 
@@ -20,15 +30,41 @@ type Lock struct {
 // lockname argument; locks with different names should be
 // independent.
 func MakeLock(ck kvtest.IKVClerk, lockname string) *Lock {
-	lk := &Lock{ck: ck}
+	lk := &Lock{ck: ck, curKey: lockname}
 	// You may add code here
 	return lk
 }
 
 func (lk *Lock) Acquire() {
 	// Your code here
+
+	//get version number
+	var value string
+	var version rpc.Tversion
+	var err rpc.Err
+
+	for {
+		value, version, err = lk.ck.Get(lk.curKey)
+		//poll until released
+		if err == rpc.ErrNoKey || value == released {
+			err = lk.ck.Put(lk.curKey, acquired, version)
+			if err == rpc.OK {
+				//if not then continue
+				lk.version = int(version) + 1
+				break
+			}
+		}
+	}
+
 }
 
 func (lk *Lock) Release() {
 	// Your code here
+
+	err := lk.ck.Put(lk.curKey, released, rpc.Tversion(lk.version))
+
+	if err != rpc.OK {
+		log.Print("false release of key not allowed")
+		return
+	}
 }

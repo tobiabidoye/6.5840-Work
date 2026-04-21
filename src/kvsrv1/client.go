@@ -6,7 +6,6 @@ import (
 	"6.5840/tester1"
 )
 
-
 type Clerk struct {
 	clnt   *tester.Clnt
 	server string
@@ -30,7 +29,16 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	//keep trying until request is successful
+	for {
+		req := rpc.GetArgs{Key: key}
+		reply := rpc.GetReply{}
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", &req, &reply)
+		if ok {
+			//when successful return
+			return reply.Value, reply.Version, reply.Err
+		}
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -52,5 +60,13 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return rpc.ErrNoKey
+	for {
+		req := rpc.PutArgs{Key: key, Value: value, Version: version}
+		rsp := rpc.PutReply{}
+
+		if ok := ck.clnt.Call(ck.server, "KVServer.Put", &req, &rsp); ok {
+			return rsp.Err
+		}
+
+	}
 }
