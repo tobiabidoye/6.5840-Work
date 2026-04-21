@@ -20,6 +20,7 @@ type Lock struct {
 	ck      kvtest.IKVClerk
 	curKey  string
 	version int
+	value   string
 	// You may add code here
 }
 
@@ -31,6 +32,7 @@ type Lock struct {
 // independent.
 func MakeLock(ck kvtest.IKVClerk, lockname string) *Lock {
 	lk := &Lock{ck: ck, curKey: lockname}
+	lk.value = kvtest.RandValue(8)
 	// You may add code here
 	return lk
 }
@@ -47,11 +49,17 @@ func (lk *Lock) Acquire() {
 		value, version, err = lk.ck.Get(lk.curKey)
 		//poll until released
 		if err == rpc.ErrNoKey || value == released {
-			err = lk.ck.Put(lk.curKey, acquired, version)
+			err = lk.ck.Put(lk.curKey, lk.value, version)
 			if err == rpc.OK {
 				//if not then continue
 				lk.version = int(version) + 1
 				break
+			} else if err == rpc.ErrMaybe {
+				value, version, _ = lk.ck.Get(lk.curKey)
+				if value == lk.value {
+					lk.version = int(version)
+					break
+				}
 			}
 		}
 	}

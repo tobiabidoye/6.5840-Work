@@ -60,13 +60,18 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
+	firstPut := true
 	for {
 		req := rpc.PutArgs{Key: key, Value: value, Version: version}
 		rsp := rpc.PutReply{}
 
 		if ok := ck.clnt.Call(ck.server, "KVServer.Put", &req, &rsp); ok {
+			if !firstPut && rsp.Err == rpc.ErrVersion {
+				return rpc.ErrMaybe
+			}
 			return rsp.Err
 		}
 
+		firstPut = false
 	}
 }
