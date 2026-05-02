@@ -7,7 +7,6 @@ package raft
 // In addition,  Make() creates a new raft peer that implements the
 // raft interface.
 
-
 import (
 	//	"bytes"
 	"math/rand"
@@ -20,6 +19,19 @@ import (
 	"6.5840/tester1"
 )
 
+type Role string
+
+const (
+	LEADER    Role = "leader"
+	FOLLOWER  Role = "follower"
+	CANDIDATE Role = "candidate"
+)
+
+type LogValue struct {
+	Term int
+	//interface which implements zero methods, empty interface, esssentially a template
+	Item interface{}
+}
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -31,7 +43,14 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	lastRpcContact  time.Time
+	allowedDuration time.Duration
+	currentTerm     int
+	//which index you voted for in peers array
+	votedFor    int
+	currentRole Role
+	//not sure what log stores yet
+	log []LogValue
 }
 
 // return currentTerm and whether this server
@@ -62,7 +81,6 @@ func (rf *Raft) persist() {
 	// rf.persister.Save(raftstate, nil)
 }
 
-
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -90,7 +108,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -100,22 +117,76 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	//term for a lagging candidate to update itself
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	curLogTerm := 0
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+		return
+	} else if args.Term > rf.currentTerm {
+		rf.currentRole = FOLLOWER
+		rf.currentTerm = args.Term
+		rf.lastRpcContact = time.Now()
+		durationInt := rand.Intn(800-400) + 400
+		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+	}
+
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		reply.VoteGranted = false
+		return
+	}
+
+	if len(rf.log) > 0 {
+		curLogTerm = rf.log[len(rf.log)-1].Term
+	}
+
+	//term check here
+	if args.LastLogTerm < curLogTerm {
+		reply.VoteGranted = false
+		return
+	}
+
+	//index check here
+	if args.LastLogIndex < len(rf.log)-1 {
+		//length of log is wrong
+		reply.VoteGranted = false
+		return
+	}
+	//now we know log is at least as up to date
+	//we can grant vote here
+
+	reply.VoteGranted = true
+	rf.votedFor = args.CandidateId
+	rf.lastRpcContact = time.Now()
+	durationInt := rand.Intn(800-400) + 400
+	//reset random duration to be between 300 and 500 milliseconds, likely have to change it but forgot what values mit specified
+	rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+	rf.currentRole = FOLLOWER
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -146,10 +217,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	//ok so this is blocking
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+
 	return ok
 }
-
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -169,7 +241,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
-
 	return index, term, isLeader
 }
 
@@ -179,10 +250,80 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
-
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
+		//lock to proect shared state
+		rf.mu.Lock()
+		elapsedTime := time.Since(rf.lastRpcContact)
+
+		if rf.currentRole != LEADER && elapsedTime > rf.allowedDuration {
+			//then send list of append entries rpcs to peers
+			// vote for yourself
+			rf.votedFor = rf.me
+			rf.currentTerm += 1
+			rf.currentRole = CANDIDATE
+			//reset allowed duration for current term
+			durationInt := rand.Intn(800-400) + 400
+			rf.allowedDuration = time.Millisecond * time.Duration(durationInt)
+
+			lastTerm := 0
+			if len(rf.log) > 0 {
+				lastTerm = rf.log[len(rf.log)-1].Term
+			}
+			curVoteReq := RequestVoteArgs{Term: rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: len(rf.log) - 1,
+				LastLogTerm:  lastTerm,
+			}
+
+			//send the rpcs non blocking, never hold lock before sending an rpc
+			numVotes := 1
+			curTerm := rf.currentTerm
+			//unlock before rpc call
+			rf.mu.Unlock()
+			for ind, _ := range rf.peers {
+
+				if ind == rf.me {
+					continue
+				}
+
+				curVoteReply := RequestVoteReply{}
+				go func(peerNum int, voteReply RequestVoteReply) {
+					//do this synchronously
+					rf.sendRequestVote(peerNum, &curVoteReq, &voteReply)
+					rf.mu.Lock()
+
+					if voteReply.Term > rf.currentTerm {
+						rf.currentRole = FOLLOWER
+						rf.currentTerm = voteReply.Term
+						rf.mu.Unlock()
+						return
+					}
+
+					if rf.currentTerm != curTerm || rf.currentRole != CANDIDATE {
+						rf.mu.Unlock()
+						return
+					}
+
+					if voteReply.VoteGranted {
+						numVotes += 1
+					}
+
+					if (numVotes) >= (len(rf.peers)/2)+1 {
+						//you have majority at this point become leader
+						rf.currentRole = LEADER
+						rf.mu.Unlock()
+						return
+					}
+					//lock when exiting a function like so
+					rf.mu.Unlock()
+				}(ind, curVoteReply)
+
+			}
+		} else {
+			rf.mu.Unlock()
+		}
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -210,7 +351,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
