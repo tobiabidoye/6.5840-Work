@@ -56,10 +56,17 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	//
+	if rf.currentRole == LEADER {
+		isleader = true
+	}
+
+	term = rf.currentTerm
 	return term, isleader
 }
 
@@ -136,6 +143,117 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// append entries rpc struct
+type AppendEntriesRequest struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	Entries      []LogValue
+	LeaderCommit int
+}
+
+//append entries rpc response struct
+
+type AppendEntriesResponse struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesResponse) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesResponse) {
+	//now for vote requests
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	curLogTerm := rf.currentTerm
+
+	if curLogTerm > args.Term {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	if curLogTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	if rf.currentRole == LEADER || rf.currentRole == CANDIDATE {
+		rf.currentRole = FOLLOWER
+	}
+
+	//reset leader election time out
+	rf.lastRpcContact = time.Now()
+	durationInt := rand.Intn(800-400) + 400
+	rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+
+	reply.Success = true
+	reply.Term = rf.currentTerm
+
+}
+
+func (rf *Raft) AppendEntriesRoutine() {
+	//send rpc every 10 milliseconds
+	for {
+		sleepTime := time.Duration(100)
+		//only send rpc if leader
+		rf.mu.Lock()
+		if rf.currentRole == LEADER {
+			//lock only if leader
+			//right now just sending empty heartbeats
+
+			dummyEntries := []LogValue{}
+			appendEntriesReq := AppendEntriesRequest{Term: rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: -1,
+				Entries:      dummyEntries,
+				LeaderCommit: -1,
+			}
+
+			rf.mu.Unlock()
+			for ind, _ := range rf.peers {
+				//send an append entries request to each peer
+				if ind == rf.me {
+					continue
+				}
+				appendEntriesResp := AppendEntriesResponse{}
+
+				//send rpc with args to peer
+				go func(serverId int, args AppendEntriesRequest, resp AppendEntriesResponse) {
+					//dont lock before rpc call
+					rf.SendAppendEntries(serverId, &args, &resp)
+					rf.mu.Lock()
+					//only case we have to not worry about success
+
+					if rf.currentRole != LEADER {
+						rf.mu.Unlock()
+						return
+					}
+
+					if resp.Term > rf.currentTerm {
+						rf.currentRole = FOLLOWER
+						rf.currentTerm = resp.Term
+						rf.votedFor = -1
+						rf.mu.Unlock()
+						return
+					}
+
+					rf.mu.Unlock()
+				}(ind, appendEntriesReq, appendEntriesResp)
+
+			}
+		} else {
+			//unlock if not leader
+			rf.mu.Unlock()
+		}
+		time.Sleep(sleepTime * time.Millisecond)
+	}
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
@@ -151,6 +269,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.Term > rf.currentTerm {
 		rf.currentRole = FOLLOWER
 		rf.currentTerm = args.Term
+		rf.votedFor = -1
 		rf.lastRpcContact = time.Now()
 		durationInt := rand.Intn(800-400) + 400
 		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
@@ -297,6 +416,7 @@ func (rf *Raft) ticker() {
 					if voteReply.Term > rf.currentTerm {
 						rf.currentRole = FOLLOWER
 						rf.currentTerm = voteReply.Term
+						rf.votedFor = -1
 						rf.mu.Unlock()
 						return
 					}
@@ -343,7 +463,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.lastRpcContact = time.Now()
+	durationInt := rand.Intn(800-400) + 400
+	rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+	rf.currentTerm = 0
+	rf.currentRole = FOLLOWER
+	rf.votedFor = -1
+	rf.log = make([]LogValue, 0)
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
@@ -351,6 +477,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.AppendEntriesRoutine()
 
 	return rf
 }
