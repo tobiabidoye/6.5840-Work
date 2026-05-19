@@ -3,8 +3,8 @@ package raft
 import (
 	"fmt"
 	"log"
-	"os"
-	"strconv"
+	_ "os"
+	_ "strconv"
 	"time"
 )
 
@@ -46,11 +46,12 @@ func DPrintf(topic logTopic, format string, a ...interface{}) {
 }
 
 func init() {
-	debug := os.Getenv("VERBOSE")
-	debugVal, _ := strconv.Atoi(debug)
+	// debug := os.Getenv("VERBOSE")
+	debugVal := true
 	//set printf log flags
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
-	if debugVal >= 1 {
+	if debugVal {
 		ToDebug = true
 	}
+
 }

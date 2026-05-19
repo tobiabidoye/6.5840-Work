@@ -150,6 +150,7 @@ type AppendEntriesRequest struct {
 	Term         int
 	LeaderId     int
 	PrevLogIndex int
+	PrevLogTerm  int
 	Entries      []LogValue
 	LeaderCommit int
 }
@@ -174,9 +175,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	defer rf.mu.Unlock()
 
 	curLogTerm := rf.currentTerm
-
+	DPrintf(dLog2, "S%d <- S%d AE T%d prevIdx=%d prevTerm=%d nEntries=%d", rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries))
 	//dont append entry from stale leader
 	if curLogTerm > args.Term {
+
+		DPrintf(dDrop, "S%d rejected AE from S%d: stale term", rf.me, args.LeaderId)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -190,6 +193,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 
 	//demote your role
 	if rf.currentRole == LEADER || rf.currentRole == CANDIDATE {
+		DPrintf(dTerm, "S%d stepping down (AE reply T%d > my T%d)", rf.me, reply.Term, rf.currentTerm)
 		rf.currentRole = FOLLOWER
 	}
 
@@ -271,8 +275,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	curLogTerm := 0
 	reply.Term = rf.currentTerm
+	DPrintf(dVote, "S%d <- S%d RV req T%d lastIdx=%d lastTerm=%d", rf.me, args.CandidateId, args.Term, args.LastLogIndex, args.LastLogTerm)
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
+		DPrintf(dDrop, "S%d denied vote to S%d: stale term (their T%d < my T%d)", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		return
 	} else if args.Term > rf.currentTerm {
 		rf.currentRole = FOLLOWER
@@ -282,6 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		reply.VoteGranted = false
+		DPrintf(dDrop, "S%d denied vote to S%d: already voted for S%d", rf.me, args.CandidateId, rf.votedFor)
 		return
 	}
 
@@ -292,12 +299,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//term check here
 	if args.LastLogTerm < curLogTerm {
 		reply.VoteGranted = false
+		DPrintf(dDrop, "S%d denied vote to S%d: log not up-to-date", rf.me, args.CandidateId)
 		return
 	}
 
 	//index check here
 	if args.LastLogTerm == curLogTerm && args.LastLogIndex < len(rf.log)-1 {
 		//length of log is wrong
+		DPrintf(dDrop, "S%d denied vote to S%d: log not up-to-date", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
@@ -305,6 +314,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//we can grant vote here
 
 	reply.VoteGranted = true
+	DPrintf(dVote, "S%d granted vote to S%d at T%d", rf.me, args.CandidateId, rf.currentTerm)
 	rf.votedFor = args.CandidateId
 	rf.lastRpcContact = time.Now()
 	durationInt := rand.Intn(800-400) + 400
@@ -369,8 +379,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) ticker() {
+	DPrintf(dInfo, "S%d ticker started", rf.me)
 	for true {
-
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
@@ -390,7 +400,7 @@ func (rf *Raft) ticker() {
 			//reset allowed duration for current term
 			durationInt := rand.Intn(800-400) + 400
 			rf.allowedDuration = time.Millisecond * time.Duration(durationInt)
-
+			DPrintf(dTimer, "S%d election timeout, becoming candidate at T%d", rf.me, rf.currentTerm)
 			lastTerm := 0
 			if len(rf.log) > 0 {
 				lastTerm = rf.log[len(rf.log)-1].Term
@@ -417,8 +427,8 @@ func (rf *Raft) ticker() {
 					//do this synchronously
 					rf.sendRequestVote(peerNum, &curVoteReq, &voteReply)
 					rf.mu.Lock()
-
 					if voteReply.Term > rf.currentTerm {
+						DPrintf(dTerm, "S%d stepping down (RV reply T%d > my T%d)", rf.me, voteReply.Term, rf.currentTerm)
 						rf.currentRole = FOLLOWER
 						rf.currentTerm = voteReply.Term
 						rf.votedFor = -1
@@ -428,17 +438,20 @@ func (rf *Raft) ticker() {
 
 					//check if world has changed
 					if rf.currentTerm != curTerm || rf.currentRole != CANDIDATE {
+						DPrintf(dInfo, "S%d stepped down world has changed and no longer leader", rf.me)
 						rf.mu.Unlock()
 						return
 					}
 
 					//if everything cool then check if you got vote
 					if voteReply.VoteGranted {
+						DPrintf(dVote, "S%d got RV reply from S%d: granted=%v term=%d", rf.me, peerNum, voteReply.VoteGranted, voteReply.Term)
 						numVotes += 1
 					}
 
 					if (numVotes) >= (len(rf.peers)/2)+1 {
 						//you have majority at this point become leader
+						DPrintf(dLeader, "S%d became leader at T%d with %d votes", rf.me, rf.currentTerm, numVotes)
 						rf.currentRole = LEADER
 						rf.mu.Unlock()
 						return
