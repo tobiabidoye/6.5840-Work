@@ -19,6 +19,8 @@ import (
 	"6.5840/tester1"
 )
 
+var ProgramStart = time.Now()
+
 type Role string
 
 const (
@@ -159,11 +161,13 @@ type AppendEntriesResponse struct {
 	Success bool
 }
 
+// rpc handler
 func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesResponse) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
+// rpc handler helper
 func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesResponse) {
 	//now for vote requests
 	rf.mu.Lock()
@@ -171,17 +175,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 
 	curLogTerm := rf.currentTerm
 
+	//dont append entry from stale leader
 	if curLogTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
+	//update your term to new leaders term and clear voted for
 	if curLogTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
 
+	//demote your role
 	if rf.currentRole == LEADER || rf.currentRole == CANDIDATE {
 		rf.currentRole = FOLLOWER
 	}
@@ -191,6 +198,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	durationInt := rand.Intn(800-400) + 400
 	rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
 
+	//successful append entries and inform leader of followers term
 	reply.Success = true
 	reply.Term = rf.currentTerm
 
@@ -270,9 +278,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentRole = FOLLOWER
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.lastRpcContact = time.Now()
-		durationInt := rand.Intn(800-400) + 400
-		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
 	}
 
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
@@ -291,7 +296,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	//index check here
-	if args.LastLogIndex < len(rf.log)-1 {
+	if args.LastLogTerm == curLogTerm && args.LastLogIndex < len(rf.log)-1 {
 		//length of log is wrong
 		reply.VoteGranted = false
 		return
@@ -421,11 +426,13 @@ func (rf *Raft) ticker() {
 						return
 					}
 
+					//check if world has changed
 					if rf.currentTerm != curTerm || rf.currentRole != CANDIDATE {
 						rf.mu.Unlock()
 						return
 					}
 
+					//if everything cool then check if you got vote
 					if voteReply.VoteGranted {
 						numVotes += 1
 					}
@@ -470,6 +477,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentRole = FOLLOWER
 	rf.votedFor = -1
 	rf.log = make([]LogValue, 0)
+	DPrintf(dInfo, "S%d started at T%d", rf.me, rf.currentTerm)
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
