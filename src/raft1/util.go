@@ -54,4 +54,6 @@ func init() {
 		ToDebug = true
 	}
 
+	//set todebug to false for testing right now
+	ToDebug = false
 }

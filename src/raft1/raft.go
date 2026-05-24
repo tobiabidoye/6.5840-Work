@@ -52,7 +52,13 @@ type Raft struct {
 	votedFor    int
 	currentRole Role
 	//not sure what log stores yet
-	log []LogValue
+	log         []LogValue
+	commitIndex int
+	lastApplied int
+	//next index to send to each peer
+	nextIndex []int
+	//index of highest match to send to each peer
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -174,33 +180,74 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	curLogTerm := rf.currentTerm
+	// curLogTerm := rf.currentTerm
 	DPrintf(dLog2, "S%d <- S%d AE T%d prevIdx=%d prevTerm=%d nEntries=%d", rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries))
 	//dont append entry from stale leader
-	if curLogTerm > args.Term {
-
+	if rf.currentTerm > args.Term {
 		DPrintf(dDrop, "S%d rejected AE from S%d: stale term", rf.me, args.LeaderId)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	//update your term to new leaders term and clear voted for
-	if curLogTerm < args.Term {
+	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.currentRole = FOLLOWER
+		//demote role
+		DPrintf(dTerm, "S%d demoted to FOLLOWER by AE from S%d at T%d", rf.me, args.LeaderId, args.Term)
 	}
 
-	//demote your role
-	if rf.currentRole == LEADER || rf.currentRole == CANDIDATE {
-		DPrintf(dTerm, "S%d stepping down (AE reply T%d > my T%d)", rf.me, reply.Term, rf.currentTerm)
-		rf.currentRole = FOLLOWER
+	//send back for decrementing
+	if args.PrevLogIndex >= len(rf.log) {
+		DPrintf(dDrop, "S%d rejected AE from S%d: sent prevLogIndex is greater than length of log", rf.me, args.LeaderId)
+		rf.lastRpcContact = time.Now()
+		durationInt := rand.Intn(800-400) + 400
+		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	//divergence in logs
+	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		//maybe ill write a helper function or not if im not feeling lazy
+
+		DPrintf(dDrop, "S%d rejected AE from S%d: prevLogIndex does not match", rf.me, args.LeaderId)
+		rf.lastRpcContact = time.Now()
+		durationInt := rand.Intn(800-400) + 400
+		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	for i := 0; i < len(args.Entries); i++ {
+		//actual log index for the local log
+		logIdx := args.PrevLogIndex + 1 + i
+		//at first logidx will be equal to then eventually greater than
+		if logIdx >= len(rf.log) {
+			// append the entire log instead of one at a time
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		} else if args.Entries[i].Term != rf.log[logIdx].Term {
+			//then truncate log
+			rf.log = rf.log[:logIdx]
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+
 	}
 
 	//reset leader election time out
 	rf.lastRpcContact = time.Now()
 	durationInt := rand.Intn(800-400) + 400
 	rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+	if args.LeaderCommit > rf.commitIndex {
+		//only ever advance monotonically
+		//this is so follower does not say it has logs it does not have or say it has committed indices which conflict with leader
+		rf.commitIndex = min(args.LeaderCommit, len(args.Entries)+args.PrevLogIndex)
+	}
 
 	//successful append entries and inform leader of followers term
 	reply.Success = true
@@ -215,49 +262,82 @@ func (rf *Raft) AppendEntriesRoutine() {
 		//only send rpc if leader
 		rf.mu.Lock()
 		if rf.currentRole == LEADER {
-			//lock only if leader
-			//right now just sending empty heartbeats
-
-			dummyEntries := []LogValue{}
-			appendEntriesReq := AppendEntriesRequest{Term: rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: -1,
-				Entries:      dummyEntries,
-				LeaderCommit: -1,
-			}
-
-			rf.mu.Unlock()
+			savedTerm := rf.currentTerm
 			for ind, _ := range rf.peers {
 				//send an append entries request to each peer
 				if ind == rf.me {
 					continue
 				}
-				appendEntriesResp := AppendEntriesResponse{}
 
-				//send rpc with args to peer
+				//check if world has changed
+
+				//append real entries
+				realEntries := []LogValue{}
+				for i := rf.nextIndex[ind]; i < len(rf.log); i++ {
+					realEntries = append(realEntries, rf.log[i])
+				}
+				//previous log index of specific peer
+				prevLogIndex := rf.nextIndex[ind] - 1
+				leaderCommit := rf.commitIndex
+
+				appendEntriesReq := AppendEntriesRequest{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  rf.log[prevLogIndex].Term,
+					LeaderCommit: leaderCommit,
+					Entries:      realEntries,
+				}
+				//then after
+				appendEntriesResp := AppendEntriesResponse{}
+				//unlock prior to rpc
 				go func(serverId int, args AppendEntriesRequest, resp AppendEntriesResponse) {
 					//dont lock before rpc call
-					rf.SendAppendEntries(serverId, &args, &resp)
+					//loop for decrementing index
+					//send in loop and decremen
+					ok := rf.SendAppendEntries(serverId, &args, &resp)
 					rf.mu.Lock()
 					//only case we have to not worry about success
+					defer rf.mu.Unlock()
 
 					if rf.currentRole != LEADER {
-						rf.mu.Unlock()
 						return
 					}
 
+					if savedTerm != rf.currentTerm {
+						return
+					}
+
+					if !ok {
+						//if rpc call never received response
+						return
+					}
 					if resp.Term > rf.currentTerm {
 						rf.currentRole = FOLLOWER
 						rf.currentTerm = resp.Term
 						rf.votedFor = -1
-						rf.mu.Unlock()
 						return
 					}
 
-					rf.mu.Unlock()
+					if resp.Success {
+						rf.matchIndex[serverId] = max(rf.matchIndex[serverId], args.PrevLogIndex+len(args.Entries))
+						rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+						return
+					}
+
+					//if none of these cases have matched we know we can decrement the nextIndex
+					if !resp.Success {
+						if rf.nextIndex[serverId] > 1 {
+							rf.nextIndex[serverId] -= 1
+						}
+						return
+					}
+					//dont update term
 				}(ind, appendEntriesReq, appendEntriesResp)
 
 			}
+			//unlock prior to goroutines scheduled
+			rf.mu.Unlock()
 		} else {
 			//unlock if not leader
 			rf.mu.Unlock()
@@ -369,12 +449,21 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := len(rf.log)
+	term := rf.currentTerm
 	isLeader := true
+
+	if rf.currentRole != LEADER {
+		isLeader = false
+		return -1, -1, isLeader
+	}
 
 	// Your code here (3B).
 
+	rf.log = append(rf.log, LogValue{Term: rf.currentTerm, Item: command})
+	//if not leader
 	return index, term, isLeader
 }
 
@@ -438,7 +527,7 @@ func (rf *Raft) ticker() {
 
 					//check if world has changed
 					if rf.currentTerm != curTerm || rf.currentRole != CANDIDATE {
-						DPrintf(dInfo, "S%d stepped down world has changed and no longer leader", rf.me)
+						DPrintf(dTrace, "S%d stepped down world has changed and no longer leader", rf.me)
 						rf.mu.Unlock()
 						return
 					}
@@ -453,6 +542,18 @@ func (rf *Raft) ticker() {
 						//you have majority at this point become leader
 						DPrintf(dLeader, "S%d became leader at T%d with %d votes", rf.me, rf.currentTerm, numVotes)
 						rf.currentRole = LEADER
+						//initialize match indices to be zero
+						for i := 0; i < len(rf.matchIndex); i++ {
+
+							if i == rf.me {
+								rf.matchIndex[i] = len(rf.log) - 1
+							} else {
+								rf.matchIndex[i] = 0
+							}
+
+							rf.nextIndex[i] = len(rf.log)
+						}
+
 						rf.mu.Unlock()
 						return
 					}
@@ -489,7 +590,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.currentRole = FOLLOWER
 	rf.votedFor = -1
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
 	rf.log = make([]LogValue, 0)
+	//append dummy value to the log 0th index
+	rf.log = append(rf.log, LogValue{Term: -1, Item: "dummy"})
 	DPrintf(dInfo, "S%d started at T%d", rf.me, rf.currentTerm)
 	// Your initialization code here (3A, 3B, 3C).
 
