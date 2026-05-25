@@ -10,6 +10,7 @@ package raft
 import (
 	//	"bytes"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 
@@ -322,6 +323,19 @@ func (rf *Raft) AppendEntriesRoutine() {
 					if resp.Success {
 						rf.matchIndex[serverId] = max(rf.matchIndex[serverId], args.PrevLogIndex+len(args.Entries))
 						rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+
+						//update match index
+						rf.matchIndex[rf.me] = len(rf.log) - 1
+						copyMatchIndices := make([]int, len(rf.matchIndex))
+						copy(copyMatchIndices, rf.matchIndex)
+						slices.Sort(copyMatchIndices)
+						//calculate median
+						medianIndex := (len(copyMatchIndices) - 1) / 2
+						toCommit := copyMatchIndices[medianIndex]
+						if rf.log[toCommit].Term == rf.currentTerm && rf.commitIndex < toCommit {
+							rf.commitIndex = toCommit
+						}
+
 						return
 					}
 
@@ -333,6 +347,7 @@ func (rf *Raft) AppendEntriesRoutine() {
 						return
 					}
 					//dont update term
+
 				}(ind, appendEntriesReq, appendEntriesResp)
 
 			}
@@ -451,17 +466,16 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index := len(rf.log)
-	term := rf.currentTerm
-	isLeader := true
 
+	isLeader := true
 	if rf.currentRole != LEADER {
 		isLeader = false
 		return -1, -1, isLeader
 	}
 
 	// Your code here (3B).
-
+	index := len(rf.log)
+	term := rf.currentTerm
 	rf.log = append(rf.log, LogValue{Term: rf.currentTerm, Item: command})
 	//if not leader
 	return index, term, isLeader
@@ -568,8 +582,41 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
+func (rf *Raft) Apply(applyCh chan raftapi.ApplyMsg) {
+	for {
+		rf.mu.Lock()
+
+		if rf.commitIndex > rf.lastApplied {
+			//gather into local slice
+			// copy to avoid race condition
+			start := rf.lastApplied + 1
+			end := rf.commitIndex
+			toApply := make([]LogValue, end-start+1)
+			copy(toApply, rf.log[start:end+1])
+			//loop over messages to apply
+			prevCommitIndex := rf.commitIndex
+			rf.lastApplied = prevCommitIndex
+			rf.mu.Unlock()
+			for ind, val := range toApply {
+				msg := raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      val.Item,
+					CommandIndex: start + ind,
+				}
+				//send message to be applied
+				applyCh <- msg
+				//advance the lastapplied index
+			}
+		} else {
+			rf.mu.Unlock()
+		}
+		//sleep for 10 milliseconds
+		time.Sleep(time.Millisecond * 10)
+	}
+}
 
 // the service or tester wants to create a Raft server. the ports
+//
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
 // have the same order. persister is a place for this server to
@@ -604,6 +651,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.AppendEntriesRoutine()
-
+	go rf.Apply(applyCh)
 	return rf
 }
