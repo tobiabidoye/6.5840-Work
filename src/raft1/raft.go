@@ -213,7 +213,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	//divergence in logs
 	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		//maybe ill write a helper function or not if im not feeling lazy
-
 		DPrintf(dDrop, "S%d rejected AE from S%d: prevLogIndex does not match", rf.me, args.LeaderId)
 		rf.lastRpcContact = time.Now()
 		durationInt := rand.Intn(800-400) + 400
