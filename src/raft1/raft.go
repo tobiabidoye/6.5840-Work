@@ -9,12 +9,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"slices"
 	"sync"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -95,6 +97,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	buf := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buf)
+	enc.Encode(rf.log)
+	enc.Encode(rf.currentTerm)
+	enc.Encode(rf.votedFor)
+	raftState := buf.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -115,6 +125,23 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	buf := bytes.NewBuffer(data)
+	dec := labgob.NewDecoder(buf)
+	var oldLog []LogValue
+	var oldTerm int
+	var votedFor int
+
+	if dec.Decode(&oldLog) != nil || dec.Decode(&oldTerm) != nil || dec.Decode(&votedFor) != nil {
+		//probably add a log here about what can and cannot be decoded
+		return
+	} else {
+		rf.log = oldLog
+		rf.currentTerm = oldTerm
+		rf.votedFor = votedFor
+		DPrintf(dInfo, "S%d restored log len=%d", rf.me, len(rf.log))
+	}
+
 }
 
 // how many bytes in Raft's persisted log?
@@ -167,6 +194,9 @@ type AppendEntriesRequest struct {
 type AppendEntriesResponse struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 // rpc handler
@@ -207,11 +237,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		//apply the optimization
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = len(rf.log)
 		return
 	}
 
 	//divergence in logs
-	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		//maybe ill write a helper function or not if im not feeling lazy
 		DPrintf(dDrop, "S%d rejected AE from S%d: prevLogIndex does not match", rf.me, args.LeaderId)
 		rf.lastRpcContact = time.Now()
@@ -219,6 +253,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		//index of first entry with that term
+		reply.XIndex = rf.GetTermFirstEntry(rf.log[args.PrevLogIndex].Term)
+		reply.XLen = len(rf.log)
 		return
 	}
 
@@ -246,13 +284,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	if args.LeaderCommit > rf.commitIndex {
 		//only ever advance monotonically
 		//this is so follower does not say it has logs it does not have or say it has committed indices which conflict with leader
-		rf.commitIndex = min(args.LeaderCommit, len(args.Entries)+args.PrevLogIndex)
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 
 	//successful append entries and inform leader of followers term
+	rf.persist()
 	reply.Success = true
 	reply.Term = rf.currentTerm
 
+}
+
+func (rf *Raft) GetTermFirstEntry(term int) int {
+	for i := 1; i < len(rf.log); i++ {
+		if rf.log[i].Term == term {
+			return i
+		}
+	}
+	//return -1 if no item in that term exists
+	return -1
 }
 
 func (rf *Raft) AppendEntriesRoutine() {
@@ -278,13 +327,18 @@ func (rf *Raft) AppendEntriesRoutine() {
 				}
 				//previous log index of specific peer
 				prevLogIndex := rf.nextIndex[ind] - 1
+				prevLogTerm := -1
+				if prevLogIndex >= 0 {
+					prevLogTerm = rf.log[prevLogIndex].Term
+				}
+
 				leaderCommit := rf.commitIndex
 
 				appendEntriesReq := AppendEntriesRequest{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
 					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  rf.log[prevLogIndex].Term,
+					PrevLogTerm:  prevLogTerm,
 					LeaderCommit: leaderCommit,
 					Entries:      realEntries,
 				}
@@ -316,6 +370,7 @@ func (rf *Raft) AppendEntriesRoutine() {
 						rf.currentRole = FOLLOWER
 						rf.currentTerm = resp.Term
 						rf.votedFor = -1
+						rf.persist()
 						return
 					}
 
@@ -340,8 +395,34 @@ func (rf *Raft) AppendEntriesRoutine() {
 
 					//if none of these cases have matched we know we can decrement the nextIndex
 					if !resp.Success {
-						if rf.nextIndex[serverId] > 1 {
-							rf.nextIndex[serverId] -= 1
+						//now for the optimization
+						if resp.XTerm == -1 {
+							rf.nextIndex[ind] = resp.XLen
+						} else if rf.GetTermFirstEntry(resp.XTerm) == -1 {
+							if resp.XIndex != 0 {
+								rf.nextIndex[ind] = resp.XIndex
+							} else {
+								rf.nextIndex[ind] = 1
+							}
+						} else if rf.GetTermFirstEntry(resp.XTerm) != -1 {
+							term := resp.XTerm
+							tempInd := -1
+							for curInd, val := range rf.log {
+								//keep switching until last term
+								if curInd == 0 {
+									continue
+								}
+
+								if val.Term == term {
+									tempInd = curInd
+								}
+							}
+
+							if tempInd != -1 {
+								rf.nextIndex[ind] = tempInd + 1
+							} else {
+								rf.nextIndex[ind] = resp.XIndex
+							}
 						}
 						return
 					}
@@ -378,6 +459,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentRole = FOLLOWER
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
@@ -415,6 +497,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//reset random duration to be between 300 and 500 milliseconds, likely have to change it but forgot what values mit specified
 	rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
 	rf.currentRole = FOLLOWER
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -476,6 +559,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.log)
 	term := rf.currentTerm
 	rf.log = append(rf.log, LogValue{Term: rf.currentTerm, Item: command})
+	rf.persist()
 	//if not leader
 	return index, term, isLeader
 }
@@ -499,6 +583,7 @@ func (rf *Raft) ticker() {
 			rf.votedFor = rf.me
 			rf.currentTerm += 1
 			rf.currentRole = CANDIDATE
+			rf.persist()
 			//reset allowed duration for current term
 			durationInt := rand.Intn(800-400) + 400
 			rf.allowedDuration = time.Millisecond * time.Duration(durationInt)
@@ -529,11 +614,13 @@ func (rf *Raft) ticker() {
 					//do this synchronously
 					rf.sendRequestVote(peerNum, &curVoteReq, &voteReply)
 					rf.mu.Lock()
+
 					if voteReply.Term > rf.currentTerm {
 						DPrintf(dTerm, "S%d stepping down (RV reply T%d > my T%d)", rf.me, voteReply.Term, rf.currentTerm)
 						rf.currentRole = FOLLOWER
 						rf.currentTerm = voteReply.Term
 						rf.votedFor = -1
+						rf.persist()
 						rf.mu.Unlock()
 						return
 					}
@@ -549,6 +636,11 @@ func (rf *Raft) ticker() {
 					if voteReply.VoteGranted {
 						DPrintf(dVote, "S%d got RV reply from S%d: granted=%v term=%d", rf.me, peerNum, voteReply.VoteGranted, voteReply.Term)
 						numVotes += 1
+					}
+
+					if rf.currentRole == LEADER {
+						rf.mu.Unlock()
+						return
 					}
 
 					if (numVotes) >= (len(rf.peers)/2)+1 {
@@ -567,7 +659,9 @@ func (rf *Raft) ticker() {
 							rf.nextIndex[i] = len(rf.log)
 						}
 
+						rf.persist()
 						rf.mu.Unlock()
+
 						return
 					}
 					//lock when exiting a function like so
@@ -602,6 +696,7 @@ func (rf *Raft) Apply(applyCh chan raftapi.ApplyMsg) {
 					Command:      val.Item,
 					CommandIndex: start + ind,
 				}
+
 				//send message to be applied
 				applyCh <- msg
 				//advance the lastapplied index

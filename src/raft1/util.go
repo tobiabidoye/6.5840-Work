@@ -47,13 +47,11 @@ func DPrintf(topic logTopic, format string, a ...interface{}) {
 
 func init() {
 	// debug := os.Getenv("VERBOSE")
-	debugVal := true
+	debugVal := false
 	//set printf log flags
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 	if debugVal {
 		ToDebug = true
 	}
 
-	//set todebug to false for testing right now
-	ToDebug = false
 }
