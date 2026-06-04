@@ -61,7 +61,9 @@ type Raft struct {
 	//next index to send to each peer
 	nextIndex []int
 	//index of highest match to send to each peer
-	matchIndex []int
+	matchIndex        []int
+	lastIncludedIndex int
+	lastIncludedTerm  int
 }
 
 // return currentTerm and whether this server
@@ -103,6 +105,8 @@ func (rf *Raft) persist() {
 	enc.Encode(rf.log)
 	enc.Encode(rf.currentTerm)
 	enc.Encode(rf.votedFor)
+	enc.Encode(rf.lastIncludedIndex)
+	enc.Encode(rf.lastIncludedTerm)
 	raftState := buf.Bytes()
 	rf.persister.Save(raftState, nil)
 }
@@ -131,17 +135,32 @@ func (rf *Raft) readPersist(data []byte) {
 	var oldLog []LogValue
 	var oldTerm int
 	var votedFor int
-
-	if dec.Decode(&oldLog) != nil || dec.Decode(&oldTerm) != nil || dec.Decode(&votedFor) != nil {
+	var lastIncludedInd int
+	var lastIncTerm int
+	if dec.Decode(&oldLog) != nil || dec.Decode(&oldTerm) != nil || dec.Decode(&votedFor) != nil || dec.Decode(&lastIncludedInd) != nil || dec.Decode(&lastIncTerm) != nil {
 		//probably add a log here about what can and cannot be decoded
 		return
 	} else {
 		rf.log = oldLog
 		rf.currentTerm = oldTerm
 		rf.votedFor = votedFor
+		rf.lastIncludedIndex = lastIncludedInd
+		rf.lastIncludedTerm = lastIncTerm
 		DPrintf(dInfo, "S%d restored log len=%d", rf.me, len(rf.log))
 	}
 
+}
+
+func (rf *Raft) ConvertLogicalToPhysical(logicalIndex int) int {
+	return logicalIndex - rf.lastIncludedIndex
+}
+
+func (rf *Raft) GetTermFromLogicalIndex(logicalIndex int) int {
+	if logicalIndex == rf.lastIncludedIndex {
+		return rf.lastIncludedTerm
+	}
+	curInd := logicalIndex - rf.lastIncludedIndex
+	return rf.log[curInd].Term
 }
 
 // how many bytes in Raft's persisted log?
@@ -736,6 +755,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogValue, 0)
 	//append dummy value to the log 0th index
 	rf.log = append(rf.log, LogValue{Term: -1, Item: "dummy"})
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	DPrintf(dInfo, "S%d started at T%d", rf.me, rf.currentTerm)
 	// Your initialization code here (3A, 3B, 3C).
 
