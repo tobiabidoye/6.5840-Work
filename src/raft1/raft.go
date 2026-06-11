@@ -64,6 +64,7 @@ type Raft struct {
 	matchIndex        []int
 	lastIncludedIndex int
 	lastIncludedTerm  int
+	curSnapshot       []byte
 }
 
 // return currentTerm and whether this server
@@ -108,7 +109,8 @@ func (rf *Raft) persist() {
 	enc.Encode(rf.lastIncludedIndex)
 	enc.Encode(rf.lastIncludedTerm)
 	raftState := buf.Bytes()
-	rf.persister.Save(raftState, nil)
+	rf.persister.Save(raftState, rf.curSnapshot)
+	DPrintf(dInfo, "persisted raft state size: %d bytes, log len: %d", rf.persister.RaftStateSize(), len(rf.log))
 }
 
 // restore previously persisted state.
@@ -176,7 +178,23 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf(dInfo, "log size prior to trimming %d", len(rf.log))
+	physicalInd := rf.ConvertLogicalToPhysical(index)
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.log[physicalInd].Term
+	//trim everything up until index
+	// rf.log = rf.log[]
+	tempLog := make([]LogValue, 0)
+	tempLog = append(tempLog, LogValue{Item: "dummy", Term: rf.lastIncludedTerm})
+	tempLog = append(tempLog, rf.log[physicalInd+1:]...)
+	rf.log = tempLog
+	rf.commitIndex = max(rf.commitIndex, index)
+	rf.lastApplied = max(rf.lastApplied, index)
+	rf.curSnapshot = snapshot
+	rf.persist()
+	DPrintf(dInfo, "log size after trimming %d", len(rf.log))
 }
 
 // example RequestVote RPC arguments structure.
@@ -240,6 +258,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		return
 	}
 
+	prevInd := rf.ConvertLogicalToPhysical(args.PrevLogIndex)
+
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -248,8 +268,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		DPrintf(dTerm, "S%d demoted to FOLLOWER by AE from S%d at T%d", rf.me, args.LeaderId, args.Term)
 	}
 
+	//stale leader sending out of date indices
+	// compare logical to logical for clarity since you can get negative items which works but isnt ideal
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		DPrintf(dDrop, "S%d rejected AE from S%d: stale previous index", rf.me, args.LeaderId)
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
 	//send back for decrementing
-	if args.PrevLogIndex >= len(rf.log) {
+	if prevInd >= len(rf.log) {
 		DPrintf(dDrop, "S%d rejected AE from S%d: sent prevLogIndex is greater than length of log", rf.me, args.LeaderId)
 		rf.lastRpcContact = time.Now()
 		durationInt := rand.Intn(800-400) + 400
@@ -259,12 +288,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		//apply the optimization
 		reply.XTerm = -1
 		reply.XIndex = -1
-		reply.XLen = len(rf.log)
+		reply.XLen = (len(rf.log)) + rf.lastIncludedIndex
 		return
 	}
 
 	//divergence in logs
-	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	//physical index should be now within the same range of this followers log
+	if prevInd > 0 && args.PrevLogTerm != rf.log[prevInd].Term {
 		//maybe ill write a helper function or not if im not feeling lazy
 		DPrintf(dDrop, "S%d rejected AE from S%d: prevLogIndex does not match", rf.me, args.LeaderId)
 		rf.lastRpcContact = time.Now()
@@ -272,16 +302,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XTerm = rf.log[prevInd].Term
 		//index of first entry with that term
-		reply.XIndex = rf.GetTermFirstEntry(rf.log[args.PrevLogIndex].Term)
-		reply.XLen = len(rf.log)
+		// should return logical index which is calculated by adding last index to the physical index
+		reply.XIndex = rf.GetTermFirstEntry(rf.log[prevInd].Term)
+
+		reply.XLen = (len(rf.log)) + rf.lastIncludedIndex
 		return
 	}
 
 	for i := 0; i < len(args.Entries); i++ {
 		//actual log index for the local log
-		logIdx := args.PrevLogIndex + 1 + i
+		logIdx := prevInd + 1 + i
 		//at first logidx will be equal to then eventually greater than
 		if logIdx >= len(rf.log) {
 			// append the entire log instead of one at a time
@@ -295,7 +327,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 		}
 
 	}
-
 	//reset leader election time out
 	rf.lastRpcContact = time.Now()
 	durationInt := rand.Intn(800-400) + 400
@@ -303,20 +334,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesRequest, reply *AppendEntriesRe
 	if args.LeaderCommit > rf.commitIndex {
 		//only ever advance monotonically
 		//this is so follower does not say it has logs it does not have or say it has committed indices which conflict with leader
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1+rf.lastIncludedIndex)
 	}
 
 	//successful append entries and inform leader of followers term
 	rf.persist()
 	reply.Success = true
 	reply.Term = rf.currentTerm
-
+	DPrintf(dLog2, "S%d AE success prevIdx=%d logLen=%d commitIndex=%d", rf.me, args.PrevLogIndex, len(rf.log), rf.commitIndex)
 }
 
 func (rf *Raft) GetTermFirstEntry(term int) int {
 	for i := 1; i < len(rf.log); i++ {
 		if rf.log[i].Term == term {
-			return i
+			//return logical index
+			return i + rf.lastIncludedIndex
 		}
 	}
 	//return -1 if no item in that term exists
@@ -341,14 +373,15 @@ func (rf *Raft) AppendEntriesRoutine() {
 
 				//append real entries
 				realEntries := []LogValue{}
-				for i := rf.nextIndex[ind]; i < len(rf.log); i++ {
+				physicalLowerBound := rf.ConvertLogicalToPhysical(rf.nextIndex[ind])
+				for i := physicalLowerBound; i < len(rf.log); i++ {
 					realEntries = append(realEntries, rf.log[i])
 				}
 				//previous log index of specific peer
 				prevLogIndex := rf.nextIndex[ind] - 1
 				prevLogTerm := -1
 				if prevLogIndex >= 0 {
-					prevLogTerm = rf.log[prevLogIndex].Term
+					prevLogTerm = rf.log[rf.ConvertLogicalToPhysical(prevLogIndex)].Term
 				}
 
 				leaderCommit := rf.commitIndex
@@ -398,14 +431,14 @@ func (rf *Raft) AppendEntriesRoutine() {
 						rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 
 						//update match index
-						rf.matchIndex[rf.me] = len(rf.log) - 1
+						rf.matchIndex[rf.me] = rf.lastIncludedIndex + (len(rf.log) - 1)
 						copyMatchIndices := make([]int, len(rf.matchIndex))
 						copy(copyMatchIndices, rf.matchIndex)
 						slices.Sort(copyMatchIndices)
 						//calculate median
 						medianIndex := (len(copyMatchIndices) - 1) / 2
 						toCommit := copyMatchIndices[medianIndex]
-						if rf.log[toCommit].Term == rf.currentTerm && rf.commitIndex < toCommit {
+						if rf.log[rf.ConvertLogicalToPhysical(toCommit)].Term == rf.currentTerm && rf.commitIndex < toCommit {
 							rf.commitIndex = toCommit
 						}
 
@@ -416,8 +449,10 @@ func (rf *Raft) AppendEntriesRoutine() {
 					if !resp.Success {
 						//now for the optimization
 						if resp.XTerm == -1 {
+							//logical space since i converted this in append entries handler
 							rf.nextIndex[ind] = resp.XLen
 						} else if rf.GetTermFirstEntry(resp.XTerm) == -1 {
+							//works since xindex is also converted to logical space unless i am wrong
 							if resp.XIndex != 0 {
 								rf.nextIndex[ind] = resp.XIndex
 							} else {
@@ -438,8 +473,9 @@ func (rf *Raft) AppendEntriesRoutine() {
 							}
 
 							if tempInd != -1 {
-								rf.nextIndex[ind] = tempInd + 1
+								rf.nextIndex[ind] = rf.lastIncludedIndex + tempInd + 1
 							} else {
+								//also logical index i think
 								rf.nextIndex[ind] = resp.XIndex
 							}
 						}
@@ -487,8 +523,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if len(rf.log) > 0 {
+	//accounting for the dummy entry
+	if len(rf.log) > 1 {
 		curLogTerm = rf.log[len(rf.log)-1].Term
+	} else {
+		curLogTerm = rf.lastIncludedTerm
 	}
 
 	//term check here
@@ -499,7 +538,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	//index check here
-	if args.LastLogTerm == curLogTerm && args.LastLogIndex < len(rf.log)-1 {
+	if args.LastLogTerm == curLogTerm && args.LastLogIndex < rf.lastIncludedIndex+len(rf.log)-1 {
 		//length of log is wrong
 		DPrintf(dDrop, "S%d denied vote to S%d: log not up-to-date", rf.me, args.CandidateId)
 		reply.VoteGranted = false
@@ -575,7 +614,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// Your code here (3B).
-	index := len(rf.log)
+	index := rf.lastIncludedIndex + len(rf.log)
 	term := rf.currentTerm
 	rf.log = append(rf.log, LogValue{Term: rf.currentTerm, Item: command})
 	rf.persist()
@@ -608,12 +647,20 @@ func (rf *Raft) ticker() {
 			rf.allowedDuration = time.Millisecond * time.Duration(durationInt)
 			DPrintf(dTimer, "S%d election timeout, becoming candidate at T%d", rf.me, rf.currentTerm)
 			lastTerm := 0
-			if len(rf.log) > 0 {
+
+			// if len(rf.log) > 0 {
+			// 	lastTerm = rf.log[len(rf.log)-1].Term
+			// }
+			//
+			if len(rf.log) > 1 {
 				lastTerm = rf.log[len(rf.log)-1].Term
+			} else {
+				lastTerm = rf.lastIncludedTerm
 			}
+
 			curVoteReq := RequestVoteArgs{Term: rf.currentTerm,
 				CandidateId:  rf.me,
-				LastLogIndex: len(rf.log) - 1,
+				LastLogIndex: rf.lastIncludedIndex + len(rf.log) - 1,
 				LastLogTerm:  lastTerm,
 			}
 
@@ -670,12 +717,12 @@ func (rf *Raft) ticker() {
 						for i := 0; i < len(rf.matchIndex); i++ {
 
 							if i == rf.me {
-								rf.matchIndex[i] = len(rf.log) - 1
+								rf.matchIndex[i] = rf.lastIncludedIndex + len(rf.log) - 1
 							} else {
 								rf.matchIndex[i] = 0
 							}
 
-							rf.nextIndex[i] = len(rf.log)
+							rf.nextIndex[i] = rf.lastIncludedIndex + len(rf.log)
 						}
 
 						rf.persist()
@@ -694,15 +741,30 @@ func (rf *Raft) ticker() {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
+
 func (rf *Raft) Apply(applyCh chan raftapi.ApplyMsg) {
 	for {
 		rf.mu.Lock()
 
-		if rf.commitIndex > rf.lastApplied {
+		if rf.lastApplied < rf.lastIncludedIndex {
+			//we can apply the snapshot
+			msg := raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.curSnapshot,
+				SnapshotIndex: rf.lastIncludedIndex,
+				SnapshotTerm:  rf.lastIncludedTerm,
+			}
+			//update highest applied index
+			rf.lastApplied = rf.lastIncludedIndex
+			//unlock so that the whole system does not freeze due to just one channel send
+			rf.mu.Unlock()
+			applyCh <- msg
+		} else if rf.commitIndex > rf.lastApplied {
 			//gather into local slice
 			// copy to avoid race condition
-			start := rf.lastApplied + 1
-			end := rf.commitIndex
+			logicalStart := rf.lastApplied + 1
+			start := rf.ConvertLogicalToPhysical(rf.lastApplied + 1)
+			end := rf.ConvertLogicalToPhysical(rf.commitIndex)
 			toApply := make([]LogValue, end-start+1)
 			copy(toApply, rf.log[start:end+1])
 			//loop over messages to apply
@@ -713,7 +775,7 @@ func (rf *Raft) Apply(applyCh chan raftapi.ApplyMsg) {
 				msg := raftapi.ApplyMsg{
 					CommandValid: true,
 					Command:      val.Item,
-					CommandIndex: start + ind,
+					CommandIndex: logicalStart + ind,
 				}
 
 				//send message to be applied
@@ -762,7 +824,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	rf.commitIndex = rf.lastIncludedIndex
+	rf.lastApplied = rf.lastIncludedIndex
+	rf.curSnapshot = persister.ReadSnapshot()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.AppendEntriesRoutine()
