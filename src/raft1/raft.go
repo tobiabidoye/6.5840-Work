@@ -65,6 +65,7 @@ type Raft struct {
 	lastIncludedIndex int
 	lastIncludedTerm  int
 	curSnapshot       []byte
+	applyCh           chan raftapi.ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -368,7 +369,55 @@ func (rf *Raft) AppendEntriesRoutine() {
 				if ind == rf.me {
 					continue
 				}
+				DPrintf(dInfo, "S%d checking peer %d nextIndex=%d lastIncludedIndex=%d", rf.me, ind, rf.nextIndex[ind], rf.lastIncludedIndex)
+				if rf.nextIndex[ind] <= rf.lastIncludedIndex {
+					installSnapshotArgs := InstallSnapshotRequest{
+						Term:              rf.currentTerm,
+						LeaderId:          rf.me,
+						LastIncludedIndex: rf.lastIncludedIndex,
+						LastIncludedTerm:  rf.lastIncludedTerm,
+						Data:              rf.curSnapshot,
+						Done:              true,
+					}
 
+					installSnapshotResp := InstallSnapshotResponse{}
+					go func(curIndex int, snapArgs InstallSnapshotRequest, snapResp InstallSnapshotResponse) {
+						ok := rf.SendInstallSnapshot(curIndex, &snapArgs, &snapResp)
+						DPrintf(dInfo, "S%d InstallSnapshot RPC to S%d ok=%v", rf.me, curIndex, ok)
+						if !ok {
+							return
+						}
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+
+						if rf.currentRole != LEADER {
+
+							DPrintf(dInfo, "leader no longer leader world changed after install snapshot leader: %d", rf.me)
+							return
+						}
+
+						if savedTerm != rf.currentTerm {
+							DPrintf(dInfo, "saved term is not equal to leader current term saved term: %d, current term: %d", savedTerm, rf.currentTerm)
+							return
+						}
+						//step down
+						if snapResp.Term > rf.currentTerm {
+							rf.currentRole = FOLLOWER
+							DPrintf(dInfo, "leader stale compared to follower after installsnapshot rpc response term: %d, leaderTerm: %d", snapResp.Term, rf.currentTerm)
+							rf.currentTerm = snapResp.Term
+							rf.votedFor = -1
+							rf.persist()
+							return
+						}
+
+						//on success update
+						DPrintf(dInfo, "leader sent successful installsnapshotrpc, leaderid %d, followerid %d", rf.me, curIndex)
+
+						rf.nextIndex[curIndex] = snapArgs.LastIncludedIndex + 1
+						rf.matchIndex[curIndex] = snapArgs.LastIncludedIndex
+					}(ind, installSnapshotArgs, installSnapshotResp)
+					continue
+				}
 				//check if world has changed
 
 				//append real entries
@@ -758,6 +807,7 @@ func (rf *Raft) Apply(applyCh chan raftapi.ApplyMsg) {
 			rf.lastApplied = rf.lastIncludedIndex
 			//unlock so that the whole system does not freeze due to just one channel send
 			rf.mu.Unlock()
+			DPrintf(dInfo, "Apply sending snapshot lastApplied=%d lastIncludedIndex=%d", rf.lastApplied, rf.lastIncludedIndex)
 			applyCh <- msg
 		} else if rf.commitIndex > rf.lastApplied {
 			//gather into local slice
@@ -790,6 +840,79 @@ func (rf *Raft) Apply(applyCh chan raftapi.ApplyMsg) {
 	}
 }
 
+type InstallSnapshotRequest struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotResponse struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshotHandler(args *InstallSnapshotRequest, reply *InstallSnapshotResponse) {
+
+	rf.mu.Lock()
+	DPrintf(dInfo, "S%d InstallSnapshotHandler called from S%d", rf.me, args.LeaderId)
+	if args.Term < rf.currentTerm || args.LastIncludedIndex < rf.lastIncludedIndex {
+		reply.Term = rf.currentTerm
+		DPrintf(dError, "Leader term is not up to date or leaders last index not up to date me: %d, currentTerm: %d, leaderTerm %d, leaderLastIndex: %d, mylastIndex %d", rf.me, rf.currentTerm, args.Term, args.LastIncludedIndex, rf.lastIncludedIndex)
+		rf.mu.Unlock()
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.currentRole = FOLLOWER
+		rf.persist()
+	}
+
+	rf.currentRole = FOLLOWER
+	rf.lastRpcContact = time.Now()
+	durationInt := rand.Intn(800-400) + 400
+	rf.allowedDuration = time.Duration(durationInt) * time.Millisecond
+
+	rf.curSnapshot = args.Data
+	//now loop through log
+	logToCopy := make([]LogValue, 0)
+	logToCopy = append(logToCopy, LogValue{Term: args.LastIncludedTerm, Item: "dummy"})
+
+	for ind, val := range rf.log {
+		//compare logical indices directly
+		if val.Term == args.LastIncludedTerm && args.LastIncludedIndex == rf.lastIncludedIndex+ind {
+			//copy all items 1 past the matching last index
+			logToCopy = append(logToCopy, rf.log[ind+1:]...)
+			break
+		}
+	}
+
+	//now set the old log to equal this log either it zeroes out or it gets the actual valid remaining log entries
+	rf.log = logToCopy
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
+	// rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+	//not sure how to update commit index before resetting state machine
+	//now reset state machine
+
+	rf.persist()
+	//unlock so items waiting on the lock dont deadlock due to a unusually long channel send
+	rf.mu.Unlock()
+
+	//update highest applied index
+	//unlock so that the whole system does not freeze due to just one channel send
+	// rf.applyCh <- msg
+}
+
+func (rf *Raft) SendInstallSnapshot(server int, args *InstallSnapshotRequest, reply *InstallSnapshotResponse) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshotHandler", args, reply)
+	return ok
+}
+
 // the service or tester wants to create a Raft server. the ports
 //
 // of all the Raft servers (including this one) are in peers[]. this
@@ -817,6 +940,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogValue, 0)
 	//append dummy value to the log 0th index
 	rf.log = append(rf.log, LogValue{Term: -1, Item: "dummy"})
+	rf.applyCh = make(chan raftapi.ApplyMsg)
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 	DPrintf(dInfo, "S%d started at T%d", rf.me, rf.currentTerm)
