@@ -1,22 +1,29 @@
 package rsm
 
 import (
+	"errors"
+	"math/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
+
+var ErrNotLeader = errors.New("not leader")
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me int
+	//id will be some n bit random identifier to avoid collisions
+	Id  int
+	Req any
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +45,14 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	db      map[int]MapValue
+	curTerm int
+}
+
+// stores the channel for readers to signal to commanders and also the command for doop
+type MapValue struct {
+	ReaderSignal chan any
+	Cmd          Op
 }
 
 // servers[] contains the ports of the set of
@@ -65,13 +80,14 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	rsm.db = make(map[int]MapValue)
+	go rsm.Reader()
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -83,5 +99,92 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+
+	rsm.mu.Lock()
+	curId := rand.Uint32()
+	safeReq := Op{Me: rsm.me, Id: int(curId), Req: req}
+	cmdChan := make(chan any, 1)
+	commitIndex, startTerm, isLeader := rsm.rf.Start(safeReq)
+
+	if !isLeader {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+
+	//now wait for a response from reader chan
+	rsm.db[commitIndex] = MapValue{Cmd: safeReq, ReaderSignal: cmdChan}
+	//received command after applying
+	rsm.mu.Unlock()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case tempCmd := <-cmdChan:
+			if tempCmd == ErrNotLeader {
+				return rpc.ErrWrongLeader, nil
+			}
+			return rpc.OK, tempCmd
+		//continuously check if you are no longer leader every 100 ms
+		case <-ticker.C:
+			//lock the channel
+			rsm.mu.Lock()
+			newTerm, isLeader := rsm.rf.GetState()
+			if newTerm != startTerm || !isLeader {
+				//clean up the index for that entry since no longer leader
+				delete(rsm.db, commitIndex)
+				rsm.mu.Unlock()
+				return rpc.ErrWrongLeader, nil
+			}
+			rsm.mu.Unlock()
+		}
+	}
+	//signal that leader stepped down
+	//return received command to the client
+}
+
+func (rsm *RSM) Reader() {
+	for {
+
+		applyMsg, ok := <-rsm.applyCh
+		if !ok {
+			return
+		}
+		//now from here
+		rsm.mu.Lock()
+
+		op, ok := applyMsg.Command.(Op)
+
+		if !ok {
+			rsm.mu.Unlock()
+			continue
+		}
+
+		//now compare
+		curValue, ok := rsm.db[applyMsg.CommandIndex]
+		//do the operation
+		toSend := rsm.sm.DoOp(op.Req)
+
+		//then send
+
+		if ok {
+			delete(rsm.db, applyMsg.CommandIndex)
+
+			var tempSend any
+
+			if op.Id != curValue.Cmd.Id {
+				//send -1 if leader steps down
+				tempSend = ErrNotLeader
+			} else {
+				tempSend = toSend
+			}
+
+			rsm.mu.Unlock()
+			curValue.ReaderSignal <- tempSend
+			continue
+		}
+
+		rsm.mu.Unlock()
+	}
+
 }
