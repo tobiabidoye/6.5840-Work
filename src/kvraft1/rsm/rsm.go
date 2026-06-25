@@ -2,7 +2,9 @@ package rsm
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
+	"reflect"
 	"sync"
 	"time"
 
@@ -115,9 +117,10 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.db[commitIndex] = MapValue{Cmd: safeReq, ReaderSignal: cmdChan}
 	//received command after applying
 	rsm.mu.Unlock()
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
+	//submit calls start so command is replicated to log and then waits for result to return to client
 	for {
 		select {
 		case tempCmd := <-cmdChan:
@@ -128,6 +131,14 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		//continuously check if you are no longer leader every 100 ms
 		case <-ticker.C:
 			//lock the channel
+			select {
+			case tempCmd := <-cmdChan:
+				if tempCmd == ErrNotLeader {
+					return rpc.ErrWrongLeader, nil
+				}
+				return rpc.OK, tempCmd
+			default:
+			}
 			rsm.mu.Lock()
 			newTerm, isLeader := rsm.rf.GetState()
 			if newTerm != startTerm || !isLeader {
@@ -144,6 +155,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 }
 
 func (rsm *RSM) Reader() {
+	//gets applychannel to apply to state machine and calls doop
 	for {
 
 		applyMsg, ok := <-rsm.applyCh
@@ -156,17 +168,17 @@ func (rsm *RSM) Reader() {
 		op, ok := applyMsg.Command.(Op)
 
 		if !ok {
+			fmt.Println("type assertion failed, type is:", reflect.TypeOf(applyMsg.Command))
 			rsm.mu.Unlock()
 			continue
 		}
 
 		//now compare
-		curValue, ok := rsm.db[applyMsg.CommandIndex]
-		//do the operation
-		toSend := rsm.sm.DoOp(op.Req)
 
+		toSend := rsm.sm.DoOp(op.Req)
 		//then send
 
+		curValue, ok := rsm.db[applyMsg.CommandIndex]
 		if ok {
 			delete(rsm.db, applyMsg.CommandIndex)
 

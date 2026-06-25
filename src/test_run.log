@@ -1,0 +1,22 @@
+go build -race -o main/rsm1d main/rsm1d.go
+cd kvraft1/rsm; go test -v -race -run 4A 
+=== RUN   TestBasic4A
+Test RSM basic (reliable network)...
+panic: assignment to entry in nil map
+
+goroutine 69 [running]:
+6.5840/kvraft1/rsm.(*RSM).Reader(0xc000168000)
+	/Users/Tobi/projects/mit/6.5840/src/kvraft1/rsm/rsm.go:180 +0x190
+created by 6.5840/kvraft1/rsm.MakeRSM in goroutine 1
+	/Users/Tobi/projects/mit/6.5840/src/kvraft1/rsm/rsm.go:85 +0x274
+panic: assignment to entry in nil map
+
+goroutine 38 [running]:
+6.5840/kvraft1/rsm.(*RSM).Reader(0xc0000a4180)
+	/Users/Tobi/projects/mit/6.5840/src/kvraft1/rsm/rsm.go:180 +0x190
+created by 6.5840/kvraft1/rsm.MakeRSM in goroutine 1
+	/Users/Tobi/projects/mit/6.5840/src/kvraft1/rsm/rsm.go:85 +0x274
+info: wrote visualization to /var/folders/hd/l4k_dy7n3296gqymhmtmjqc40000gp/T/porcupine-3756955567.html
+exit status 1
+FAIL	6.5840/kvraft1/rsm	9.356s
+make: *** [rsm1] Error 1

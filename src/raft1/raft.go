@@ -66,6 +66,7 @@ type Raft struct {
 	lastIncludedTerm  int
 	curSnapshot       []byte
 	applyCh           chan raftapi.ApplyMsg
+	signalAE          chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -359,10 +360,17 @@ func (rf *Raft) GetTermFirstEntry(term int) int {
 func (rf *Raft) AppendEntriesRoutine() {
 	//send rpc every 10 milliseconds
 	for {
-		sleepTime := time.Duration(100)
+		/* sleepTime := time.Duration(100) */
 		//only send rpc if leader
+		/* rf.mu.Unlock() */
+		select {
+		case <-rf.signalAE:
+		//dont hold lock and sleep for 100ms
+		case <-time.After(100 * time.Millisecond):
+		}
 		rf.mu.Lock()
 		if rf.currentRole == LEADER {
+			/* sleepTime = time.Duration(10) */
 			savedTerm := rf.currentTerm
 			for ind, _ := range rf.peers {
 				//send an append entries request to each peer
@@ -541,7 +549,6 @@ func (rf *Raft) AppendEntriesRoutine() {
 			//unlock if not leader
 			rf.mu.Unlock()
 		}
-		time.Sleep(sleepTime * time.Millisecond)
 	}
 }
 
@@ -667,7 +674,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	rf.log = append(rf.log, LogValue{Term: rf.currentTerm, Item: command})
 	rf.persist()
-	//if not leader
+	//if leader
+	select {
+	//signal leader to wake up
+	case rf.signalAE <- struct{}{}:
+	default:
+	}
 	return index, term, isLeader
 }
 
@@ -938,6 +950,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.log = make([]LogValue, 0)
+	rf.signalAE = make(chan struct{}, 1)
 	//append dummy value to the log 0th index
 	rf.log = append(rf.log, LogValue{Term: -1, Item: "dummy"})
 	rf.applyCh = make(chan raftapi.ApplyMsg)
