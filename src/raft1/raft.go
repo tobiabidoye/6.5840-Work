@@ -69,6 +69,12 @@ type Raft struct {
 	signalAE          chan struct{}
 }
 
+func (rf *Raft) GetLastIncludedIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastIncludedIndex
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -182,6 +188,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if index <= rf.lastIncludedIndex {
+		return
+	}
+
 	DPrintf(dInfo, "log size prior to trimming %d", len(rf.log))
 	physicalInd := rf.ConvertLogicalToPhysical(index)
 	rf.lastIncludedIndex = index
@@ -495,6 +506,9 @@ func (rf *Raft) AppendEntriesRoutine() {
 						//calculate median
 						medianIndex := (len(copyMatchIndices) - 1) / 2
 						toCommit := copyMatchIndices[medianIndex]
+						if toCommit <= rf.lastIncludedIndex {
+							return
+						}
 						if rf.log[rf.ConvertLogicalToPhysical(toCommit)].Term == rf.currentTerm && rf.commitIndex < toCommit {
 							rf.commitIndex = toCommit
 						}
@@ -818,8 +832,8 @@ func (rf *Raft) Apply(applyCh chan raftapi.ApplyMsg) {
 			//update highest applied index
 			rf.lastApplied = rf.lastIncludedIndex
 			//unlock so that the whole system does not freeze due to just one channel send
-			rf.mu.Unlock()
 			DPrintf(dInfo, "Apply sending snapshot lastApplied=%d lastIncludedIndex=%d", rf.lastApplied, rf.lastIncludedIndex)
+			rf.mu.Unlock()
 			applyCh <- msg
 		} else if rf.commitIndex > rf.lastApplied {
 			//gather into local slice
@@ -907,17 +921,22 @@ func (rf *Raft) InstallSnapshotHandler(args *InstallSnapshotRequest, reply *Inst
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
-	// rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+	/* rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex) */
 	//not sure how to update commit index before resetting state machine
 	//now reset state machine
-
+	/* msg := raftapi.ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  args.LastIncludedTerm,
+	} */
 	rf.persist()
 	//unlock so items waiting on the lock dont deadlock due to a unusually long channel send
 	rf.mu.Unlock()
 
 	//update highest applied index
 	//unlock so that the whole system does not freeze due to just one channel send
-	// rf.applyCh <- msg
+	/* rf.applyCh <- msg */
 }
 
 func (rf *Raft) SendInstallSnapshot(server int, args *InstallSnapshotRequest, reply *InstallSnapshotResponse) bool {

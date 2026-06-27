@@ -9,7 +9,8 @@ type Raft interface {
 	// Ask a Raft for its current term, and whether it thinks it is
 	// leader
 	GetState() (int, bool)
-
+	//getter
+	GetLastIncludedIndex() int
 	// For Snaphots (3D)
 	Snapshot(index int, snapshot []byte)
 	PersistBytes() int

@@ -2,9 +2,7 @@ package rsm
 
 import (
 	"errors"
-	"fmt"
 	"math/rand"
-	"reflect"
 	"sync"
 	"time"
 
@@ -47,8 +45,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	db      map[int]MapValue
-	curTerm int
+	db          map[int]MapValue
+	curTerm     int
+	LastApplied int
 }
 
 // stores the channel for readers to signal to commanders and also the command for doop
@@ -83,6 +82,10 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 	rsm.db = make(map[int]MapValue)
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+	}
 	go rsm.Reader()
 	return rsm
 }
@@ -157,7 +160,6 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 func (rsm *RSM) Reader() {
 	//gets applychannel to apply to state machine and calls doop
 	for {
-
 		applyMsg, ok := <-rsm.applyCh
 		if !ok {
 			return
@@ -165,18 +167,30 @@ func (rsm *RSM) Reader() {
 		//now from here
 		rsm.mu.Lock()
 
+		//is not a command its a snapshot
+		if applyMsg.SnapshotValid {
+			rsm.sm.Restore(applyMsg.Snapshot)
+			rsm.LastApplied = applyMsg.SnapshotIndex
+			rsm.mu.Unlock()
+			continue
+		}
+
 		op, ok := applyMsg.Command.(Op)
 
 		if !ok {
-			fmt.Println("type assertion failed, type is:", reflect.TypeOf(applyMsg.Command))
 			rsm.mu.Unlock()
 			continue
 		}
 
 		//now compare
-
+		rsm.LastApplied = applyMsg.CommandIndex
 		toSend := rsm.sm.DoOp(op.Req)
 		//then send
+
+		if rsm.rf.GetLastIncludedIndex() < rsm.LastApplied && (rsm.maxraftstate/2) < rsm.rf.PersistBytes() && rsm.maxraftstate != -1 {
+			snapshot := rsm.sm.Snapshot()
+			rsm.rf.Snapshot(rsm.LastApplied, snapshot)
+		}
 
 		curValue, ok := rsm.db[applyMsg.CommandIndex]
 		if ok {

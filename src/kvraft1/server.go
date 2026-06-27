@@ -1,7 +1,9 @@
 package kvraft
 
 import (
+	"bytes"
 	"errors"
+
 	/* "fmt" */
 	"sync"
 
@@ -23,17 +25,17 @@ type KVServer struct {
 }
 
 type FilterKey struct {
-	key      string
-	clientId int64
+	Key      string
+	ClientId int64
 }
 type VersionErr struct {
-	versionNo int
+	VersionNo int
 	Err       rpc.Err
 }
 
 type ValueVersion struct {
-	value     string
-	versionNo int
+	Value     string
+	VersionNo int
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -48,19 +50,19 @@ func (kv *KVServer) DoOp(req any) any {
 	switch r := req.(type) {
 	case rpc.PutArgs:
 		//check if it exists in the deduplication map
-		if dedupCheck, ok := kv.dedupTracker[FilterKey{key: r.Key, clientId: r.ClerkId}]; ok {
-			if r.Version == rpc.Tversion(dedupCheck.versionNo) {
+		if dedupCheck, ok := kv.dedupTracker[FilterKey{Key: r.Key, ClientId: r.ClerkId}]; ok {
+			if r.Version == rpc.Tversion(dedupCheck.VersionNo) {
 				//equivalent versions return cached version
 				return rpc.PutReply{Err: dedupCheck.Err}
 			}
 		}
 
 		//check if it is in the store, works for zero values since the map will send zero value if key doesnt exist
-		if int(r.Version) == kv.kvStore[r.Key].versionNo {
+		if int(r.Version) == kv.kvStore[r.Key].VersionNo {
 			//store new put
 			//in dedup tracker store version the client sees
-			kv.dedupTracker[FilterKey{key: r.Key, clientId: r.ClerkId}] = VersionErr{versionNo: int(r.Version), Err: rpc.OK}
-			kv.kvStore[r.Key] = ValueVersion{versionNo: int(r.Version + 1), value: r.Value}
+			kv.dedupTracker[FilterKey{Key: r.Key, ClientId: r.ClerkId}] = VersionErr{VersionNo: int(r.Version), Err: rpc.OK}
+			kv.kvStore[r.Key] = ValueVersion{VersionNo: int(r.Version + 1), Value: r.Value}
 			return rpc.PutReply{Err: rpc.OK}
 		}
 
@@ -72,7 +74,7 @@ func (kv *KVServer) DoOp(req any) any {
 		return rpc.PutReply{Err: rpc.ErrVersion}
 	case rpc.GetArgs:
 		if val, ok := kv.kvStore[r.Key]; ok {
-			return rpc.GetReply{Value: val.value, Version: rpc.Tversion(val.versionNo), Err: rpc.OK}
+			return rpc.GetReply{Value: val.Value, Version: rpc.Tversion(val.VersionNo), Err: rpc.OK}
 		}
 		//fake key in the map
 		return rpc.GetReply{Err: rpc.ErrNoKey}
@@ -83,11 +85,43 @@ func (kv *KVServer) DoOp(req any) any {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	buf := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buf)
+	if err := enc.Encode(kv.kvStore); err != nil {
+		panic(err)
+	}
+
+	if err := enc.Encode(kv.dedupTracker); err != nil {
+		panic(err)
+	}
+
+	return buf.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	buf := bytes.NewBuffer(data)
+	dec := labgob.NewDecoder(buf)
+	/* kv.dedupTracker = make(map[FilterKey]VersionErr)
+	kv.kvStore = make(map[string]ValueVersion) */
+
+	tempStore := make(map[string]ValueVersion)
+	tempDedup := make(map[FilterKey]VersionErr)
+	if dec.Decode(&tempStore) != nil || dec.Decode(&tempDedup) != nil {
+		return
+	} else {
+		kv.kvStore = tempStore
+		kv.dedupTracker = tempDedup
+	}
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -142,7 +176,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
-
+	labgob.Register(FilterKey{})
+	labgob.Register(VersionErr{})
+	labgob.Register(ValueVersion{})
 	kv := &KVServer{me: me}
 
 	kv.dedupTracker = make(map[FilterKey]VersionErr)
